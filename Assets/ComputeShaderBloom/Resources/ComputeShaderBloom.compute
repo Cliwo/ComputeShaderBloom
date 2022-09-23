@@ -1,0 +1,184 @@
+#pragma kernel CSPrefilter
+#pragma kernel CSDownsampling
+#pragma kernel CSUpsampling
+#pragma kernel CSCombiner;
+
+float _SampleScale;
+half _Threshold;
+half _Intensity;
+half3 _Curve;
+
+int _InputWidth;
+int _InputHeight;
+
+Texture2D<float4> Input;
+Texture2D<float4> UpSampleBase;
+RWTexture2D<float4> Output;
+
+#pragma multi_compile _ UNITY_COLORSPACE_GAMMA
+#pragma multi_compile _ HIGH_QUALITY
+
+half4 EncodeHDR(float3 rgb)
+{
+#if USE_RGBM
+    rgb *= 1.0 / 8;
+    float m = max(max(rgb.r, rgb.g), max(rgb.b, 1e-6));
+    m = ceil(m * 255) / 255;
+    return half4(rgb / m, m);
+#else
+    return half4(rgb, 0);
+#endif
+}
+
+float3 DecodeHDR(half4 rgba)
+{
+#if USE_RGBM
+    return rgba.rgb * rgba.a * 8;
+#else
+    return rgba.rgb;
+#endif
+}
+
+half3 SafeHDR(half3 c) { return min(c, 65000); }
+half4 SafeHDR(half4 c) { return min(c, 65000); }
+
+inline half3 GammaToLinearSpace (half3 sRGB)
+{
+    // Approximate version from http://chilliant.blogspot.com.au/2012/08/srgb-approximations-for-hlsl.html?m=1
+    return sRGB * (sRGB * (sRGB * 0.305306011h + 0.682171111h) + 0.012522878h);
+
+    // Precise version, useful for debugging.
+    //return half3(GammaToLinearSpaceExact(sRGB.r), GammaToLinearSpaceExact(sRGB.g), GammaToLinearSpaceExact(sRGB.b));
+}
+
+inline half3 LinearToGammaSpace (half3 linRGB)
+{
+    linRGB = max(linRGB, half3(0.h, 0.h, 0.h));
+    // An almost-perfect approximation from http://chilliant.blogspot.com.au/2012/08/srgb-approximations-for-hlsl.html?m=1
+    return max(1.055h * pow(linRGB, 0.416666667h) - 0.055h, 0.h);
+
+    // Exact version, useful for debugging.
+    //return half3(LinearToGammaSpaceExact(linRGB.r), LinearToGammaSpaceExact(linRGB.g), LinearToGammaSpaceExact(linRGB.b));
+}
+
+half3 Median(half3 a, half3 b, half3 c)
+{
+    return a + b + c - min(min(a, b), c) - max(max(a, b), c);
+}
+
+// Brightness function
+half Brightness(half3 c)
+{
+    return max(max(c.r, c.g), c.b);
+}
+
+float2 GetValidIndex(float2 WH, float2 Index)
+{
+    return float2(clamp(Index.x, 0, WH.x) , clamp(Index.y, 0, WH.y));
+}
+
+half3 GetFilteredInput(float2 uv)
+{
+    float2 WH = float2(_InputWidth, _InputHeight);
+    
+    half4 s0 = SafeHDR(Input[GetValidIndex(WH, uv)]);
+    half3 m = s0.rgb;
+    
+#if UNITY_COLORSPACE_GAMMA
+    m = GammaToLinearSpace(m);
+#endif
+
+    half br = Brightness(m);
+    half rq = clamp(br - _Curve.x, 0, _Curve.y);
+    rq = _Curve.z * rq * rq;
+    
+    m *= max(rq, br - _Threshold) / max(br, 1e-5);
+    return m;
+}
+
+
+[numthreads(16,16,1)]
+void CSPrefilter (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = id.xy * 2 + 1;
+
+    half3 s = (GetFilteredInput(uv + float2(1.0f, 1.0f))); 
+    s += (GetFilteredInput(uv + float2(-1.0f, 1.0f)));
+    s += (GetFilteredInput(uv + float2(1.0f, -1.0f)));
+    s += (GetFilteredInput(uv + float2(-1.0f, -1.0f)));
+    
+    Output[id.xy] = EncodeHDR(s * (0.25));
+}
+
+[numthreads(8,8,1)]
+void CSDownsampling (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (id.xy * 2 + 1);
+    float2 WH = float2(_InputWidth, _InputHeight);
+    
+    half3 s  = DecodeHDR(Input[GetValidIndex(WH, uv + float2(1.0f, 1.0f))]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + float2(-1.0f, 1.0f))]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + float2(1.0f, -1.0f))]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + float2(-1.0f, -1.0f))]);
+    
+    Output[id.xy] = EncodeHDR(s * (0.25));
+}
+
+half3 UpsampleFilter(float2 uv)
+{
+    float2 WH = float2(_InputWidth, _InputHeight);
+    
+#if HIGH_QUALITY
+    // 9-tap bilinear upsampler (tent filter)
+    float4 d = float4(1, 1, -1, 0) * _SampleScale;
+    
+    half3 s;
+    s  = DecodeHDR(Input[GetValidIndex(WH,  uv - d.xy)]);
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv - d.wy)]) * 2;
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv - d.zy)]);
+    
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv + d.zw)]) * 2;
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv       )]) * 4;
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv + d.xw)]) * 2;
+    
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv + d.zy)]);
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv + d.wy)]) * 2;
+    s += DecodeHDR(Input[GetValidIndex(WH,  uv + d.xy)]);
+    
+    return s * (0.0625);
+#else
+    // 4-tap bilinear upsampler
+    float4 d = float4(-1, -1, +1, +1) * _SampleScale;
+    
+    half3 s;
+    s  = DecodeHDR(Input[GetValidIndex(WH, uv + d.xy)]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + d.zy)]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + d.xw)]);
+    s += DecodeHDR(Input[GetValidIndex(WH, uv + d.zw)]);
+    
+    return s * (0.25); 
+#endif
+}
+
+[numthreads(8,8,1)]
+void CSUpsampling (uint3 id : SV_DispatchThreadID)
+{
+    half3 base = DecodeHDR(UpSampleBase[id.xy]);
+    half3 blur = UpsampleFilter(id.xy * 0.5f);
+    Output[id.xy] = EncodeHDR(base + blur);
+}
+
+[numthreads(16,16,1)]
+void CSCombiner (uint3 id : SV_DispatchThreadID)
+{
+    half4 base = UpSampleBase[id.xy];
+    half3 blur = UpsampleFilter(id.xy * 0.5f);
+#if UNITY_COLORSPACE_GAMMA
+    base.rgb = GammaToLinearSpace(base.rgb);
+#endif
+    half3 cout = base.rgb + blur * _Intensity;
+#if UNITY_COLORSPACE_GAMMA
+    cout = LinearToGammaSpace(cout);
+#endif
+    Output[id.xy] = half4(cout, base.a);
+}
